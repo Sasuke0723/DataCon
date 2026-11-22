@@ -25,6 +25,7 @@ from datacon.tools.sandbox import (
     BuildResult,
     ProbeReport,
     ReplayResult,
+    SandboxPolicyError,
     SandboxUnavailable,
 )
 
@@ -34,6 +35,29 @@ VALID_FAULT_KINDS = frozenset(
     {
         "retryable_build_failure",
         "build_diagnose_failure",
+        "container_start_error",
+        "timeout",
+        "oom",
+        "log_truncated",
+        "lease_expired",
+        "stale_generation",
+        "transient_db_error",
+    }
+)
+PROBE_FAULT_KINDS = frozenset(
+    {
+        "container_start_error",
+        "timeout",
+        "oom",
+        "log_truncated",
+        "lease_expired",
+        "stale_generation",
+        "transient_db_error",
+    }
+)
+BUILD_FAULT_KINDS = VALID_FAULT_KINDS
+REPLAY_FAULT_KINDS = frozenset(
+    {
         "container_start_error",
         "timeout",
         "oom",
@@ -153,24 +177,30 @@ class FakeSandbox:
         return [call for call in self.calls if call.operation == "probe"]
 
     @staticmethod
-    def _validate_fault(fault: str) -> str:
-        if fault not in VALID_FAULT_KINDS:
+    def _validate_fault(
+        fault: str, allowed: frozenset[str] = VALID_FAULT_KINDS
+    ) -> str:
+        if fault not in allowed:
             raise ValueError(
-                f"unknown fault kind {fault!r}; expected one of {sorted(VALID_FAULT_KINDS)}"
+                f"unsupported fault kind {fault!r}; expected one of {sorted(allowed)}"
             )
         return fault
 
     def inject_build_faults(self, faults: Sequence[str]) -> None:
         for fault in faults:
-            self._build_faults.append(self._validate_fault(fault))
+            self._build_faults.append(self._validate_fault(fault, BUILD_FAULT_KINDS))
 
     def inject_replay_faults(self, faults: Sequence[str]) -> None:
         for fault in faults:
-            self._replay_faults.append(self._validate_fault(fault))
+            self._replay_faults.append(self._validate_fault(fault, REPLAY_FAULT_KINDS))
 
     def inject_probe_faults(self, faults: Sequence[str]) -> None:
         for fault in faults:
-            self._probe_faults.append(self._validate_fault(fault))
+            self._probe_faults.append(self._validate_fault(fault, PROBE_FAULT_KINDS))
+
+    def get_provenance_face_bytes(self, version: str) -> bytes | None:
+        """Return raw provenance face bytes for ``version`` without embedding bytes in metadata."""
+        return self.provenance_faces.get(version)
 
     def _next_container(self, suffix: str) -> tuple[int, str]:
         self._seq += 1
@@ -237,6 +267,30 @@ class FakeSandbox:
                 outcome_status="raised",
             )
             self._maybe_raise_exception_fault(fault)
+        if fault in ("timeout", "oom", "log_truncated"):
+            advance_by = (
+                float(deadline_seconds)
+                if fault == "timeout"
+                else min(0.1, deadline_seconds)
+            )
+            self.clock.advance(advance_by)
+            self._record(
+                seq=seq,
+                operation="probe",
+                version=None,
+                phase=None,
+                input_digest=None,
+                compile_args=(),
+                container_name=container,
+                fault=fault,
+                outcome_status="raised",
+            )
+            messages = {
+                "timeout": "isolation probe timed out",
+                "oom": "isolation probe was OOM-killed",
+                "log_truncated": "isolation probe output exceeded the capture budget",
+            }
+            raise SandboxPolicyError(messages[fault])
         self.clock.advance(min(0.1, deadline_seconds))
         self._record(
             seq=seq,
@@ -320,9 +374,11 @@ class FakeSandbox:
             "retryable": False,
         }
         if version in self.provenance_faces:
-            metadata["provenance_face_bytes"] = self.provenance_faces[version]
+            face_bytes = self.provenance_faces[version]
+            metadata["provenance_face_digest"] = _sha256_digest(face_bytes)
+            metadata["provenance_face_size"] = len(face_bytes)
 
-        if fault in ("retryable_build_failure", "build_diagnose_failure"):
+        if fault == "retryable_build_failure":
             status = "build_failed"
             exit_code = 2
             artifact = None
@@ -332,6 +388,18 @@ class FakeSandbox:
             ).encode("utf-8")
             metadata["exit_code"] = 2
             metadata["retryable"] = True
+            metadata["fault"] = fault
+        elif fault == "build_diagnose_failure":
+            status = "build_failed"
+            exit_code = 2
+            artifact = None
+            log = (
+                f"[{self.clock.timestamp()}] fake non-retryable build diagnose failure "
+                f"({fault}) for {version}\n"
+            ).encode("utf-8")
+            metadata["exit_code"] = 2
+            metadata["retryable"] = False
+            metadata["diagnose_failed"] = True
             metadata["fault"] = fault
         elif fault == "timeout":
             duration = float(deadline_seconds)
@@ -566,20 +634,6 @@ class FakeReviewGate:
         self.checks.append(record)
 
         if (
-            self.review_deadline_at is not None
-            and self.clock.now() > self.review_deadline_at
-        ):
-            return ReviewDecisionStub(
-                edge="archive",
-                decision="expired",
-                reason_code="REVIEW_EXPIRED",
-                approval_digest=None,
-                envelope_digest=envelope_digest,
-                first_plan_digest=first_plan_digest,
-                decided_at=decided_at,
-            )
-
-        if (
             self.expected_first_plan_digest is not None
             and first_plan_digest != self.expected_first_plan_digest
         ):
@@ -594,11 +648,25 @@ class FakeReviewGate:
             )
 
         if (
+            self.review_deadline_at is not None
+            and self.clock.now() >= self.review_deadline_at
+        ):
+            return ReviewDecisionStub(
+                edge="archive",
+                decision="expired",
+                reason_code="REVIEW_EXPIRED",
+                approval_digest=None,
+                envelope_digest=envelope_digest,
+                first_plan_digest=first_plan_digest,
+                decided_at=decided_at,
+            )
+
+        if (
             self.expected_envelope_digest is not None
             and envelope_digest != self.expected_envelope_digest
         ):
             return ReviewDecisionStub(
-                edge="archive",
+                edge="await_review",
                 decision="envelope_mismatch",
                 reason_code="REVIEW_ENVELOPE_MISMATCH",
                 approval_digest=None,

@@ -121,6 +121,20 @@ def test_graph_nodes_and_edges_match_v02_readme():
         "expected 2 distinct review -> build edges (#15 human first plan and #16 in-round policy), "
         f"got {len(review_to_build)}"
     )
+    review_edge_tokens = [repr(edge).lower() for edge in review_to_build]
+    assert len(set(review_edge_tokens)) == 2, (
+        f"review -> build edges #15 and #16 must be distinct, got {review_to_build!r}"
+    )
+    assert any(
+        "human" in token or "first" in token for token in review_edge_tokens
+    ), (
+        f"review -> build edge #15 must identify human first-plan approval: {review_to_build!r}"
+    )
+    assert any(
+        "policy" in token or "admit" in token for token in review_edge_tokens
+    ), (
+        f"review -> build edge #16 must identify in-round policy admission: {review_to_build!r}"
+    )
 
     in_job_expected_pairs = {
         (src, dst)
@@ -130,6 +144,11 @@ def test_graph_nodes_and_edges_match_v02_readme():
     missing_compiled = sorted(in_job_expected_pairs - compiled_edges)
     assert not missing_compiled, (
         f"compiled LangGraph is missing in-job edges from README §5: {missing_compiled}"
+    )
+    extra_compiled = sorted(compiled_edges - in_job_expected_pairs)
+    assert not extra_compiled, (
+        "compiled LangGraph contains unexpected or non-in-job edges "
+        f"(family-level #23/#26 must not be wired as in-job edges): {extra_compiled}"
     )
 
 
@@ -169,6 +188,12 @@ def test_build_diagnose_retry_is_bounded_to_once():
     assert outcome.reason_code == "BUILD_FAILED", (
         f"expected reason_code='BUILD_FAILED' after retry exhaustion, got {outcome.reason_code!r}"
     )
+    assert "verify" not in outcome.visited_nodes, (
+        f"exhausted build retry must not enter verify: visited_nodes={outcome.visited_nodes}"
+    )
+    assert len(sandbox.replay_calls) == 0, (
+        f"exhausted build retry must never invoke sandbox.replay, got {len(sandbox.replay_calls)} call(s)"
+    )
 
 
 def test_node_reentry_is_a_noop():
@@ -199,14 +224,45 @@ def test_node_reentry_is_a_noop():
 
     for stage in reentry_nodes:
         idempotency_key = (job_id, stage, f"{stage}_step", 1, 1)
+        builds_before = len(sandbox.build_calls)
+        replays_before = len(sandbox.replay_calls)
+        reviews_before = review_gate.review_writes
+        admissions_before = len(envelope_policy.admissions)
+        archives_before = runner.archive_count(job_id)
+
         first = runner.execute_node(
             family_id=family_id,
             idempotency_key=idempotency_key,
         )
         builds_after_first = len(sandbox.build_calls)
         replays_after_first = len(sandbox.replay_calls)
+        reviews_after_first = review_gate.review_writes
         admissions_after_first = len(envelope_policy.admissions)
         charges_after_first = runner.charge_count(job_id)
+        archives_after_first = runner.archive_count(job_id)
+
+        if stage == "build":
+            assert builds_after_first > builds_before, (
+                "first entry to 'build' must perform at least one build call "
+                "(re-entry test must not pass vacuously)"
+            )
+        elif stage == "verify":
+            assert replays_after_first > replays_before, (
+                "first entry to 'verify' must perform at least one replay call "
+                "(re-entry test must not pass vacuously)"
+            )
+        elif stage == "review":
+            assert (reviews_after_first > reviews_before) or (
+                admissions_after_first > admissions_before
+            ), (
+                "first entry to 'review' must record a human review or policy admission "
+                "(re-entry test must not pass vacuously)"
+            )
+        elif stage == "archive":
+            assert archives_after_first > archives_before, (
+                "first entry to 'archive' must record an archive write "
+                "(re-entry test must not pass vacuously)"
+            )
 
         second = runner.execute_node(
             family_id=family_id,
@@ -223,11 +279,17 @@ def test_node_reentry_is_a_noop():
         assert len(sandbox.replay_calls) == replays_after_first, (
             f"duplicate replay attempt on node re-entry for stage={stage!r}"
         )
+        assert review_gate.review_writes == reviews_after_first, (
+            f"duplicate review write on node re-entry for stage={stage!r}"
+        )
         assert len(envelope_policy.admissions) == admissions_after_first, (
             f"duplicate admission on node re-entry for stage={stage!r}"
         )
         assert runner.charge_count(job_id) == charges_after_first, (
             f"duplicate budget charge on node re-entry for stage={stage!r}"
+        )
+        assert runner.archive_count(job_id) == archives_after_first, (
+            f"duplicate archive write on node re-entry for stage={stage!r}"
         )
 
 
@@ -250,6 +312,12 @@ def test_reverse_route_archives_as_unsupported():
         target_kind="binary",
     )
 
+    assert "route" in outcome.visited_nodes, (
+        f"reverse target must pass through 'route' (edge #11), got visited_nodes={outcome.visited_nodes}"
+    )
+    assert "hypothesis_aggregator" not in outcome.visited_nodes, (
+        f"reverse route must not enter hypothesis_aggregator: visited_nodes={outcome.visited_nodes}"
+    )
     assert "build" not in outcome.visited_nodes, (
         f"reverse route reached build: visited_nodes={outcome.visited_nodes}"
     )
@@ -282,6 +350,9 @@ def test_campaign_branch_is_mounted_in_graph():
     assert ("campaign", "verify") not in compiled_edges, (
         "campaign must never connect directly to verify (campaign does not replace validation)"
     )
+    assert ("campaign", "hypothesis_aggregator") not in compiled_edges, (
+        "campaign -> hypothesis_aggregator (#23) is a family-level transition, not an in-job edge"
+    )
 
     orchestration_edges = getattr(workflow, "ORCHESTRATION_EDGES", None)
     assert orchestration_edges is not None, (
@@ -300,7 +371,10 @@ def test_campaign_branch_is_mounted_in_graph():
 
 def test_family_level_transitions_create_next_round_child():
     clock = FakeClock()
-    sandbox = FakeSandbox(clock=clock)
+    # Inject a deterministic inconclusive round-1 replay outcome (TIMEOUT -> INCONCLUSIVE)
+    # so edge #26 (verify -> hypothesis_aggregator) is genuinely triggered per README §5,
+    # rather than terminating after round 1 with NOT_REPRODUCED (edge #25).
+    sandbox = FakeSandbox(clock=clock, replay_faults=("timeout",))
     review_gate = FakeReviewGate(clock=clock, decision="approve")
     envelope_policy = FakeEnvelopePolicy(clock=clock, default_admit=True)
 
@@ -329,6 +403,12 @@ def test_family_level_transitions_create_next_round_child():
     assert campaign_child.job_kind == "campaign" and campaign_child.round_no is None, (
         f"campaign child must have job_kind='campaign' and round_no=None, got {campaign_child!r}"
     )
+    assert campaign_child.parent_job_id == family_id, (
+        f"campaign child must belong to family {family_id}, got {campaign_child!r}"
+    )
+    assert "verify" not in campaign_child.visited_nodes, (
+        f"campaign child must never run verify in-place (edge #23): {campaign_child.visited_nodes}"
+    )
     assert campaign_child.terminal_node == "archive", (
         "campaign child must archive itself before next round child is created"
     )
@@ -348,6 +428,9 @@ def test_family_level_transitions_create_next_round_child():
         f"expected round_no sequence [1, 2], got {[child.round_no for child in round_children]}"
     )
     for child in round_children:
+        assert child.job_kind == "round", (
+            f"each spawned round child must have job_kind='round': {child!r}"
+        )
         assert child.parent_job_id == family_id and child.terminal_node == "archive", (
             f"each spawned round child must belong to family {family_id} and archive itself: {child!r}"
         )
@@ -355,7 +438,9 @@ def test_family_level_transitions_create_next_round_child():
 
 def test_family_children_execute_serially():
     clock = FakeClock()
-    sandbox = FakeSandbox(clock=clock)
+    # Deterministic round-1 INCONCLUSIVE ensures campaign + round 1 + round 2 execute
+    # so serial single-slot scheduling is observed across >= 3 child execution windows.
+    sandbox = FakeSandbox(clock=clock, replay_faults=("timeout",))
     review_gate = FakeReviewGate(clock=clock, decision="approve")
     envelope_policy = FakeEnvelopePolicy(clock=clock, default_admit=True)
 

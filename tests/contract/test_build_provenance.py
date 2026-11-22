@@ -41,10 +41,6 @@ def _sha256_hex(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-def _digest(data: bytes) -> str:
-    return "sha256:" + _sha256_hex(data)
-
-
 def _import_build_provenance():
     return importlib.import_module("datacon.build_provenance")
 
@@ -67,7 +63,15 @@ def _make_build_spec(
     )
     spec: dict[str, Any] = {
         "kind": kind,
-        "build": build or (["cmake", "--build", "build", "--target", "parser"] if kind == "cmake" else ["make", "-C", "src", "parser"]),
+        "build": (
+            list(build)
+            if build is not None
+            else (
+                ["cmake", "--build", "build", "--target", "parser"]
+                if kind == "cmake"
+                else ["make", "-C", "src", "parser"]
+            )
+        ),
         "install": [],
         "env": env
         if env is not None
@@ -82,16 +86,19 @@ def _make_build_spec(
         "shell_face_review": shell_face_review,
     }
     if kind == "cmake":
-        spec["configure"] = configure or [
-            "cmake",
-            "-S",
-            ".",
-            "-B",
-            "build",
-            "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON",
-            "-DCMAKE_BUILD_TYPE=RelWithDebInfo",
-            "-DCMAKE_C_COMPILER=clang",
-        ]
+        spec["configure"] = (
+            list(configure)
+            if configure is not None
+            else [
+                "cmake",
+                "-S",
+                ".",
+                "-B",
+                "build",
+                "-DCMAKE_BUILD_TYPE=RelWithDebInfo",
+                "-DCMAKE_C_COMPILER=clang",
+            ]
+        )
     return spec
 
 
@@ -123,7 +130,8 @@ def _write_v2_bundle(
     root: Path,
     *,
     bundle_kind: str,
-    include_build_provenance: bool,
+    provenance_versions: tuple[str, ...] = ("vulnerable", "fixed"),
+    report_rules_version: str | None = None,
 ) -> Path:
     root.mkdir(parents=True, exist_ok=False)
     family_id = str(uuid4())
@@ -134,8 +142,7 @@ def _write_v2_bundle(
     if bundle_kind == "campaign":
         plan["round_no"] = None
         plan["inputs"] = None
-    plan_bytes = jsonutil.canonical_bytes(plan) + b"\n"
-    plan_digest = _digest(plan_bytes)
+
     envelope = {
         "mode": "guided" if bundle_kind == "campaign" else "fixed",
         "allowed_mutation_families": ["byte_flip"] if bundle_kind == "campaign" else [],
@@ -145,7 +152,7 @@ def _write_v2_bundle(
             else {"allowed_ops": [], "max_input_bytes": 0}
         ),
         "seed_corpus_digest": "sha256:" + "1" * 64 if bundle_kind == "campaign" else None,
-        "fuzz_image_digest": "sha256:" + "2" * 64 if bundle_kind == "campaign" else None,
+        "fuzz_image_digest": plan["image_digest"] if bundle_kind == "campaign" else None,
         "harness_digest": plan["harness_digest"],
         "max_rounds": 4 if bundle_kind == "campaign" else 1,
         "max_total_seconds": 900,
@@ -153,8 +160,46 @@ def _write_v2_bundle(
         "accepted_signature_set": [plan["asan_signature"]],
         "admission_predicate_version": "admission-v1",
     }
+    envelope_digest = jsonutil.digest_json(envelope)
     envelope_bytes = jsonutil.canonical_bytes(envelope) + b"\n"
-    envelope_digest = _digest(envelope_bytes)
+
+    plan["envelope_digest"] = envelope_digest
+    plan_digest = jsonutil.digest_json(
+        {key: value for key, value in plan.items() if key != "analysis"}
+    )
+    plan_bytes = jsonutil.canonical_bytes(plan) + b"\n"
+
+    review_doc = {
+        "job_id": family_id,
+        "plan_digest": plan_digest,
+        "decision": "approve",
+        "reviewer_id": "reviewer-01",
+        "decided_at": "2099-01-01T00:00:00.000000Z",
+    }
+    report_review = {
+        "reviewer_id": review_doc["reviewer_id"],
+        "decision": review_doc["decision"],
+        "plan_digest": review_doc["plan_digest"],
+        "decided_at": review_doc["decided_at"],
+    }
+
+    replays_list: list[dict[str, Any]] = []
+    if bundle_kind == "execution":
+        for version in ("vulnerable", "fixed"):
+            for phase in ("normal", "candidate_1", "candidate_2"):
+                input_digest = (
+                    plan["inputs"]["normal"]
+                    if phase == "normal"
+                    else plan["inputs"]["candidate"]
+                )
+                replays_list.append(
+                    {
+                        "version": version,
+                        "phase": phase,
+                        "status": "completed",
+                        "input_digest": input_digest,
+                    }
+                )
 
     verdict = None if bundle_kind == "campaign" else "INCONCLUSIVE"
     reason_code = None if bundle_kind == "campaign" else "EVIDENCE_INCOMPLETE"
@@ -164,6 +209,11 @@ def _write_v2_bundle(
         f"- Reason: `{reason_code or ''}`\n"
     ).encode("utf-8")
 
+    effective_report_rules = (
+        report_rules_version
+        if report_rules_version is not None
+        else plan["build_provenance_rules_version"]
+    )
     report_doc: dict[str, Any] = {
         "schema_version": 2,
         "bundle_kind": bundle_kind,
@@ -171,15 +221,18 @@ def _write_v2_bundle(
         "job_id": job_id,
         "parent_job_id": family_id,
         "round_no": None if bundle_kind == "campaign" else 1,
+        "case_id": plan["case_id"],
+        "cve_id": plan["cve_id"],
         "plan_digest": plan_digest,
         "envelope_digest": envelope_digest,
         "verdict": verdict,
         "state": verdict,
         "reason_code": reason_code,
+        "review": report_review,
         "build_ref": None,
         "reuse_origin": None,
         "experiment_digest": None,
-        "build_provenance_rules_version": "build-provenance-v1",
+        "build_provenance_rules_version": effective_report_rules,
         "build_provenance": {
             "vulnerable": {
                 "face": "compile_commands.json",
@@ -193,6 +246,8 @@ def _write_v2_bundle(
             },
             "comparable": True,
         },
+        "admissions": [],
+        "experiments": [],
         "budget": {
             "max_total_seconds": 900,
             "max_fuzz_seconds": 300 if bundle_kind == "campaign" else 0,
@@ -206,24 +261,14 @@ def _write_v2_bundle(
         "evidence_complete": True,
         "report_markdown_sha256": _sha256_hex(report_md),
     }
+    if bundle_kind == "execution":
+        report_doc["replays"] = replays_list
 
     files_spec: dict[str, tuple[str, bytes]] = {
         "report.json": ("report_json", jsonutil.canonical_bytes(report_doc) + b"\n"),
         "report.md": ("report_markdown", report_md),
         "plan.json": ("plan", plan_bytes),
-        "review.json": (
-            "review",
-            jsonutil.canonical_bytes(
-                {
-                    "job_id": family_id,
-                    "plan_digest": plan_digest,
-                    "decision": "approve",
-                    "reviewer_id": "reviewer-01",
-                    "decided_at": "2099-01-01T00:00:00.000000Z",
-                }
-            )
-            + b"\n",
-        ),
+        "review.json": ("review", jsonutil.canonical_bytes(review_doc) + b"\n"),
         "envelope.json": ("envelope", envelope_bytes),
         "budget/snapshot.json": (
             "budget_snapshot",
@@ -231,7 +276,10 @@ def _write_v2_bundle(
         ),
         "metadata/execution.json": (
             "execution_metadata",
-            jsonutil.canonical_bytes({"job_id": job_id, "generation": 1}) + b"\n",
+            jsonutil.canonical_bytes(
+                {"job_id": job_id, "plan_digest": plan_digest, "generation": 1}
+            )
+            + b"\n",
         ),
         "metadata/probe.json": (
             "probe",
@@ -259,7 +307,7 @@ def _write_v2_bundle(
             "build_artifact",
             f"elf-{version}".encode("utf-8"),
         )
-        if include_build_provenance:
+        if version in provenance_versions:
             files_spec[f"build/{version}/build_provenance/compile_commands.json"] = (
                 "build_provenance",
                 _fixture_bytes(fixture_name),
@@ -272,25 +320,23 @@ def _write_v2_bundle(
             jsonutil.canonical_bytes({"rng_seed": 42, "crashes": 0}) + b"\n",
         )
     else:
-        for version in ("vulnerable", "fixed"):
-            for phase in ("normal", "candidate_1", "candidate_2"):
-                stdout_role = "normal_output" if phase == "normal" else "replay_stdout"
-                stderr_role = "normal_error" if phase == "normal" else "asan_log"
-                files_spec[f"replay/{version}/{phase}/stdout.log"] = (
-                    stdout_role,
-                    b"OK\n",
-                )
-                files_spec[f"replay/{version}/{phase}/stderr.log"] = (
-                    stderr_role,
-                    b"",
-                )
-                files_spec[f"replay/{version}/{phase}/metadata.json"] = (
-                    "replay_metadata",
-                    jsonutil.canonical_bytes(
-                        {"version": version, "phase": phase, "status": "completed"}
-                    )
-                    + b"\n",
-                )
+        for replay_item in replays_list:
+            version = replay_item["version"]
+            phase = replay_item["phase"]
+            stdout_role = "normal_output" if phase == "normal" else "replay_stdout"
+            stderr_role = "normal_error" if phase == "normal" else "asan_log"
+            files_spec[f"replay/{version}/{phase}/stdout.log"] = (
+                stdout_role,
+                b"OK\n",
+            )
+            files_spec[f"replay/{version}/{phase}/stderr.log"] = (
+                stderr_role,
+                b"",
+            )
+            files_spec[f"replay/{version}/{phase}/metadata.json"] = (
+                "replay_metadata",
+                jsonutil.canonical_bytes(replay_item) + b"\n",
+            )
 
     entries: list[dict[str, Any]] = []
     for rel_path, (role, payload) in sorted(files_spec.items()):
@@ -316,7 +362,7 @@ def _write_v2_bundle(
         "plan_digest": plan_digest,
         "envelope_digest": envelope_digest,
         "experiment_digest": None,
-        "build_provenance_rules_version": "build-provenance-v1",
+        "build_provenance_rules_version": plan["build_provenance_rules_version"],
         "verdict": verdict,
         "reason_code": reason_code,
         "created_at": "2099-01-01T00:00:00Z",
@@ -352,6 +398,32 @@ def test_declared_flags_must_be_subset_of_effective_flags():
     )
     assert "-D_GNU_SOURCE" in result.error_detail and "fixed" in result.error_detail, (
         f"failure detail must locate version and missing declared flag: {result.error_detail!r}"
+    )
+
+    # §5 Rule 8: declared ⊆ effective is multiset inclusion, not plain set inclusion.
+    # cmake_flags_connected has 2 CUs each carrying `-lfoo` once, so 3 occurrences in
+    # declared_compile_flags exceeds effective multiplicity under both per-CU and flattened counts.
+    connected_face = _fixture_bytes("cmake_flags_connected.compile_commands.json")
+    multiset_result = provenance.verify_build_provenance(
+        kind="cmake",
+        declared_compile_flags=[
+            "-fsanitize=address",
+            "-g",
+            "-O1",
+            "-lfoo",
+            "-lfoo",
+            "-lfoo",
+        ],
+        vulnerable_face=connected_face,
+        fixed_face=connected_face,
+        repo_root=REPO_ROOT,
+    )
+    assert multiset_result.comparable is False, (
+        "declared flag multiplicity exceeding effective count was accepted (set vs multiset)"
+    )
+    assert multiset_result.reason_code == "BUILD_PROVENANCE_MISSING", (
+        "expected BUILD_PROVENANCE_MISSING when declared multiset count exceeds effective count, "
+        f"got {multiset_result.reason_code!r}"
     )
 
 
@@ -431,6 +503,52 @@ def test_include_order_is_significant():
         f"unexpected normalized sequence for -I b -I a: {ba_norm!r}"
     )
 
+    # §5 Rule 5 & Rule 6: duplicate -I keeps first occurrence only; -L/-l/-isystem/-include
+    # must never be deduplicated or reordered.
+    dedup_norm = provenance.normalize_compile_flags(
+        [
+            "-I",
+            "a",
+            "-I",
+            "b",
+            "-Ia",
+            "-L",
+            "lib",
+            "-Llib",
+            "-l",
+            "foo",
+            "-lbar",
+            "-lfoo",
+            "-isystem",
+            "/opt/s1",
+            "-isystem/opt/s1",
+            "-include",
+            "include/a.h",
+            "-includeinclude/a.h",
+        ],
+        repo_root=REPO_ROOT,
+    )
+    assert dedup_norm == [
+        "-Ia",
+        "-Ib",
+        "-Llib",
+        "-Llib",
+        "-lfoo",
+        "-lbar",
+        "-lfoo",
+        "-isystem",
+        "/opt/s1",
+        "-isystem",
+        "/opt/s1",
+        "-include",
+        "include/a.h",
+        "-include",
+        "include/a.h",
+    ], (
+        "duplicate -I must keep first occurrence only while -L/-l/-isystem/-include "
+        f"must not be deduplicated or reordered: {dedup_norm!r}"
+    )
+
     face_ab = _fixture_bytes("cmake_include_order_ab.compile_commands.json")
     face_ba = _fixture_bytes("cmake_include_order_ba.compile_commands.json")
     result = provenance.verify_build_provenance(
@@ -504,6 +622,17 @@ def test_connected_and_split_flag_forms_are_equivalent():
     assert norm_split == norm_connected == expected_canonical, (
         f"split and joined flag forms were treated as different or non-canonical: "
         f"split={norm_split!r}, connected={norm_connected!r}, expected={expected_canonical!r}"
+    )
+
+    # §5 Rule 3 closed-set boundary: options outside {-I,-L,-l,-D,-U,-isystem,-include}
+    # must not be merged across adjacent tokens.
+    non_closed = ["-fsanitize=address", "-O", "1", "-std", "c11"]
+    norm_non_closed = provenance.normalize_compile_flags(
+        non_closed, repo_root=REPO_ROOT
+    )
+    assert norm_non_closed == ["-fsanitize=address", "-O", "1", "-std", "c11"], (
+        "options outside the closed 7-item set must not be merged: "
+        f"got {norm_non_closed!r}"
     )
 
     cmake_result = provenance.verify_build_provenance(
@@ -655,33 +784,56 @@ def test_validation_bundle_requires_build_provenance(tmp_path: Path):
     complete_exec = _write_v2_bundle(
         tmp_path / "exec-complete",
         bundle_kind="execution",
-        include_build_provenance=True,
+        provenance_versions=("vulnerable", "fixed"),
     )
     verified = evidence.verify_bundle(complete_exec)
     assert verified.manifest["schema_version"] == 2, (
         f"expected v2 execution bundle with build_provenance to verify, got {verified.manifest!r}"
     )
 
+    complete_campaign = _write_v2_bundle(
+        tmp_path / "campaign-complete",
+        bundle_kind="campaign",
+        provenance_versions=("vulnerable", "fixed"),
+    )
+    verified_campaign = evidence.verify_bundle(complete_campaign)
+    assert (
+        verified_campaign.manifest["schema_version"] == 2
+        and verified_campaign.manifest["bundle_kind"] == "campaign"
+    ), (
+        "expected v2 campaign bundle with both build_provenance faces to verify, "
+        f"got {verified_campaign.manifest!r}"
+    )
+
     missing_exec = _write_v2_bundle(
         tmp_path / "exec-missing-provenance",
         bundle_kind="execution",
-        include_build_provenance=False,
+        provenance_versions=(),
     )
     with pytest.raises(evidence.BundleError, match="build_provenance"):
         evidence.verify_bundle(missing_exec)
 
+    single_missing_exec = _write_v2_bundle(
+        tmp_path / "exec-single-missing-provenance",
+        bundle_kind="execution",
+        provenance_versions=("vulnerable",),
+    )
+    with pytest.raises(evidence.BundleError, match="build_provenance"):
+        evidence.verify_bundle(single_missing_exec)
+
     missing_campaign = _write_v2_bundle(
         tmp_path / "campaign-missing-provenance",
         bundle_kind="campaign",
-        include_build_provenance=False,
+        provenance_versions=(),
     )
     with pytest.raises(evidence.BundleError, match="build_provenance"):
         evidence.verify_bundle(missing_campaign)
 
 
-def test_build_provenance_rules_version_is_bound_in_plan():
+def test_build_provenance_rules_version_is_bound_in_plan(tmp_path: Path):
     plan_v1_rules = _make_plan_v2(rules_version="build-provenance-v1")
-    plan_v2_rules = _make_plan_v2(rules_version="build-provenance-v2")
+    plan_v2_rules = deepcopy(plan_v1_rules)
+    plan_v2_rules["build_provenance_rules_version"] = "build-provenance-v2"
 
     digest_v1 = contracts.plan_digest(plan_v1_rules)
     digest_v2 = contracts.plan_digest(plan_v2_rules)
@@ -705,9 +857,45 @@ def test_build_provenance_rules_version_is_bound_in_plan():
     with pytest.raises(ValueError, match="build_provenance_rules_version"):
         contracts.plan_digest(missing_rules)
 
+    # §8 & test-plan-delta.md L145: build_provenance_rules_version is also bound in report.json.
+    ok_bundle = _write_v2_bundle(
+        tmp_path / "rules-bound-ok",
+        bundle_kind="execution",
+        provenance_versions=("vulnerable", "fixed"),
+    )
+    verified = evidence.verify_bundle(ok_bundle)
+    report_doc = json.loads(verified.file_data["report.json"].decode("utf-8"))
+    assert report_doc.get("build_provenance_rules_version") == "build-provenance-v1", (
+        "report.json must bind build_provenance_rules_version matching plan.json: "
+        f"got {report_doc.get('build_provenance_rules_version')!r}"
+    )
+
+    drifted_report_bundle = _write_v2_bundle(
+        tmp_path / "rules-report-drifted",
+        bundle_kind="execution",
+        provenance_versions=("vulnerable", "fixed"),
+        report_rules_version="build-provenance-v2",
+    )
+    with pytest.raises(evidence.BundleError, match="build_provenance_rules_version"):
+        evidence.verify_bundle(drifted_report_bundle)
+
 
 def test_missing_face_blocks_plan_freeze():
     provenance = _import_build_provenance()
+
+    # §3 L132-160 canonical CMake BuildSpec (without explicit -DCMAKE_EXPORT_COMPILE_COMMANDS=ON;
+    # the fixed executor template injects export flags) and §5 Make BuildSpec with CC shim must freeze.
+    valid_cmake = _make_build_spec(kind="cmake")
+    valid_cmake_decision = provenance.validate_build_spec_for_freeze(valid_cmake)
+    assert valid_cmake_decision.ok is True and valid_cmake_decision.reason_code is None, (
+        f"valid §3 CMake BuildSpec must be allowed to freeze: {valid_cmake_decision!r}"
+    )
+
+    valid_make = _make_build_spec(kind="make")
+    valid_make_decision = provenance.validate_build_spec_for_freeze(valid_make)
+    assert valid_make_decision.ok is True and valid_make_decision.reason_code is None, (
+        f"valid §5 Make BuildSpec with CC shim must be allowed to freeze: {valid_make_decision!r}"
+    )
 
     make_without_shim = _make_build_spec(
         kind="make",
@@ -721,17 +909,46 @@ def test_missing_face_blocks_plan_freeze():
         f"expected BUILD_PROVENANCE_MISSING for Make without CC shim, got {make_decision.reason_code!r}"
     )
 
-    cmake_without_export = _make_build_spec(
+    cmake_empty_configure = _make_build_spec(kind="cmake", configure=[])
+    cmake_empty_decision = provenance.validate_build_spec_for_freeze(cmake_empty_configure)
+    assert cmake_empty_decision.ok is False, (
+        "CMake BuildSpec with empty configure was allowed to freeze"
+    )
+    assert cmake_empty_decision.reason_code == "BUILD_PROVENANCE_MISSING", (
+        "expected BUILD_PROVENANCE_MISSING for CMake with empty configure, "
+        f"got {cmake_empty_decision.reason_code!r}"
+    )
+
+    cmake_missing_configure = _make_build_spec(kind="cmake")
+    del cmake_missing_configure["configure"]
+    cmake_missing_decision = provenance.validate_build_spec_for_freeze(cmake_missing_configure)
+    assert cmake_missing_decision.ok is False, (
+        "CMake BuildSpec missing configure field was allowed to freeze"
+    )
+    assert cmake_missing_decision.reason_code == "BUILD_PROVENANCE_MISSING", (
+        "expected BUILD_PROVENANCE_MISSING for CMake missing configure, "
+        f"got {cmake_missing_decision.reason_code!r}"
+    )
+
+    cmake_export_disabled = _make_build_spec(
         kind="cmake",
-        configure=["cmake", "-S", ".", "-B", "build", "-DCMAKE_C_COMPILER=clang"],
+        configure=[
+            "cmake",
+            "-S",
+            ".",
+            "-B",
+            "build",
+            "-DCMAKE_EXPORT_COMPILE_COMMANDS=OFF",
+            "-DCMAKE_C_COMPILER=clang",
+        ],
     )
-    cmake_decision = provenance.validate_build_spec_for_freeze(cmake_without_export)
-    assert cmake_decision.ok is False, (
-        "CMake BuildSpec without compile_commands.json export was allowed to freeze"
+    cmake_disabled_decision = provenance.validate_build_spec_for_freeze(cmake_export_disabled)
+    assert cmake_disabled_decision.ok is False, (
+        "CMake BuildSpec explicitly disabling compile_commands.json export was allowed to freeze"
     )
-    assert cmake_decision.reason_code == "BUILD_PROVENANCE_MISSING", (
-        f"expected BUILD_PROVENANCE_MISSING for CMake without compile_commands export, "
-        f"got {cmake_decision.reason_code!r}"
+    assert cmake_disabled_decision.reason_code == "BUILD_PROVENANCE_MISSING", (
+        "expected BUILD_PROVENANCE_MISSING when CMake explicitly sets "
+        f"CMAKE_EXPORT_COMPILE_COMMANDS=OFF, got {cmake_disabled_decision.reason_code!r}"
     )
 
     legacy_make_env = _make_build_spec(kind="make")
@@ -768,6 +985,44 @@ def test_shell_recipe_requires_separate_face_review():
     baseline_digest = provenance.shell_face_digest(
         baseline_log, repo_root="/work/run-0001/repo"
     )
+
+    # Half-present shell provenance: digest without review or review without digest must block freeze.
+    digest_without_review = _make_build_spec(
+        kind="shell",
+        build=["sh", "./build.sh"],
+        env={"CC": "clang"},
+        shell_recipe_digest="sha256:" + "c" * 64,
+        shell_face_digest=baseline_digest,
+        shell_face_review=None,
+    )
+    freeze_no_review = provenance.validate_build_spec_for_freeze(digest_without_review)
+    assert freeze_no_review.ok is False and (
+        freeze_no_review.reason_code == "BUILD_PROVENANCE_MISSING"
+    ), (
+        "shell BuildSpec with shell_face_digest but missing shell_face_review must fail freeze: "
+        f"{freeze_no_review!r}"
+    )
+
+    review_without_digest = _make_build_spec(
+        kind="shell",
+        build=["sh", "./build.sh"],
+        env={"CC": "clang"},
+        shell_recipe_digest="sha256:" + "c" * 64,
+        shell_face_digest=None,
+        shell_face_review={
+            "reviewer_id": "reviewer-01",
+            "reviewed_at": "2099-01-01T00:00:00Z",
+            "face_kind": "build_log",
+        },
+    )
+    freeze_no_digest = provenance.validate_build_spec_for_freeze(review_without_digest)
+    assert freeze_no_digest.ok is False and (
+        freeze_no_digest.reason_code == "BUILD_PROVENANCE_MISSING"
+    ), (
+        "shell BuildSpec with shell_face_review but missing shell_face_digest must fail freeze: "
+        f"{freeze_no_digest!r}"
+    )
+
     reviewed_shell = _make_build_spec(
         kind="shell",
         build=["sh", "./build.sh"],
