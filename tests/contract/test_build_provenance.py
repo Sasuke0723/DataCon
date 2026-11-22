@@ -1,0 +1,808 @@
+"""T13 / TC-15 / TC-06 / TC-03: build provenance, effective flags and BuildSpec contracts.
+
+Test coordinates are anchored to docs/spec/v0.2/test-plan-delta.md §2 (T13),
+docs/spec/v0.2/interface-contract-delta.md §5 & §8, and ADR-005.
+"""
+
+from __future__ import annotations
+
+from copy import deepcopy
+import hashlib
+import importlib
+import json
+from pathlib import Path
+from typing import Any
+from uuid import uuid4
+
+import pytest
+from test_plan import PLAN as BASE_PLAN_V1
+
+from datacon import contracts, evidence, jsonutil
+
+PROVENANCE_FIXTURES = Path(__file__).resolve().parents[1] / "fixtures" / "provenance"
+REPO_ROOT = "/work/repo"
+
+BASE_DECLARED_FLAGS = [
+    "-fsanitize=address",
+    "-g",
+    "-O1",
+    "-Iinclude",
+    "-D_GNU_SOURCE",
+]
+
+
+def _fixture_bytes(name: str) -> bytes:
+    path = PROVENANCE_FIXTURES / name
+    assert path.is_file(), f"missing provenance test fixture: {path}"
+    return path.read_bytes()
+
+
+def _sha256_hex(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def _digest(data: bytes) -> str:
+    return "sha256:" + _sha256_hex(data)
+
+
+def _import_build_provenance():
+    return importlib.import_module("datacon.build_provenance")
+
+
+def _make_build_spec(
+    *,
+    kind: str = "cmake",
+    declared_compile_flags: list[str] | None = None,
+    env: dict[str, str] | None = None,
+    configure: list[str] | None = None,
+    build: list[str] | None = None,
+    shell_recipe_digest: str | None = None,
+    shell_face_digest: str | None = None,
+    shell_face_review: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    flags = (
+        list(declared_compile_flags)
+        if declared_compile_flags is not None
+        else list(BASE_DECLARED_FLAGS)
+    )
+    spec: dict[str, Any] = {
+        "kind": kind,
+        "build": build or (["cmake", "--build", "build", "--target", "parser"] if kind == "cmake" else ["make", "-C", "src", "parser"]),
+        "install": [],
+        "env": env
+        if env is not None
+        else {
+            "CC": "/opt/datacon/cc-shim" if kind == "make" else "clang",
+            "CFLAGS": " ".join(flags),
+        },
+        "outputs": ["build/parser" if kind == "cmake" else "src/parser"],
+        "declared_compile_flags": flags,
+        "shell_recipe_digest": shell_recipe_digest,
+        "shell_face_digest": shell_face_digest,
+        "shell_face_review": shell_face_review,
+    }
+    if kind == "cmake":
+        spec["configure"] = configure or [
+            "cmake",
+            "-S",
+            ".",
+            "-B",
+            "build",
+            "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON",
+            "-DCMAKE_BUILD_TYPE=RelWithDebInfo",
+            "-DCMAKE_C_COMPILER=clang",
+        ]
+    return spec
+
+
+def _make_plan_v2(*, rules_version: str = "build-provenance-v1") -> dict[str, Any]:
+    family_id = str(uuid4())
+    build_spec = _make_build_spec(kind="cmake")
+    plan = deepcopy(BASE_PLAN_V1)
+    plan.update(
+        {
+            "schema_version": 2,
+            "family_id": family_id,
+            "parent_job_id": family_id,
+            "round_no": 1,
+            "parent_approval_digest": None,
+            "envelope_digest": "sha256:" + "5" * 64,
+            "build_ref": None,
+            "build_spec": build_spec,
+            "compile_flags": list(BASE_DECLARED_FLAGS),
+            "build_recipe_digest": jsonutil.digest_json(build_spec),
+            "experiment_digest": None,
+            "build_provenance_rules_version": rules_version,
+            "policy_version": "policy-v2.0",
+        }
+    )
+    return plan
+
+
+def _write_v2_bundle(
+    root: Path,
+    *,
+    bundle_kind: str,
+    include_build_provenance: bool,
+) -> Path:
+    root.mkdir(parents=True, exist_ok=False)
+    family_id = str(uuid4())
+    job_id = str(uuid4())
+    plan = _make_plan_v2()
+    plan["family_id"] = family_id
+    plan["parent_job_id"] = family_id
+    if bundle_kind == "campaign":
+        plan["round_no"] = None
+        plan["inputs"] = None
+    plan_bytes = jsonutil.canonical_bytes(plan) + b"\n"
+    plan_digest = _digest(plan_bytes)
+    envelope = {
+        "mode": "guided" if bundle_kind == "campaign" else "fixed",
+        "allowed_mutation_families": ["byte_flip"] if bundle_kind == "campaign" else [],
+        "mutation_limits": (
+            {"allowed_ops": ["byte_flip"], "max_input_bytes": 4096}
+            if bundle_kind == "campaign"
+            else {"allowed_ops": [], "max_input_bytes": 0}
+        ),
+        "seed_corpus_digest": "sha256:" + "1" * 64 if bundle_kind == "campaign" else None,
+        "fuzz_image_digest": "sha256:" + "2" * 64 if bundle_kind == "campaign" else None,
+        "harness_digest": plan["harness_digest"],
+        "max_rounds": 4 if bundle_kind == "campaign" else 1,
+        "max_total_seconds": 900,
+        "max_fuzz_seconds": 300 if bundle_kind == "campaign" else 0,
+        "accepted_signature_set": [plan["asan_signature"]],
+        "admission_predicate_version": "admission-v1",
+    }
+    envelope_bytes = jsonutil.canonical_bytes(envelope) + b"\n"
+    envelope_digest = _digest(envelope_bytes)
+
+    verdict = None if bundle_kind == "campaign" else "INCONCLUSIVE"
+    reason_code = None if bundle_kind == "campaign" else "EVIDENCE_INCOMPLETE"
+    report_md = (
+        f"# DataCon Report\n\n"
+        f"- Verdict: **{verdict or 'PENDING'}**\n"
+        f"- Reason: `{reason_code or ''}`\n"
+    ).encode("utf-8")
+
+    report_doc: dict[str, Any] = {
+        "schema_version": 2,
+        "bundle_kind": bundle_kind,
+        "family_id": family_id,
+        "job_id": job_id,
+        "parent_job_id": family_id,
+        "round_no": None if bundle_kind == "campaign" else 1,
+        "plan_digest": plan_digest,
+        "envelope_digest": envelope_digest,
+        "verdict": verdict,
+        "state": verdict,
+        "reason_code": reason_code,
+        "build_ref": None,
+        "reuse_origin": None,
+        "experiment_digest": None,
+        "build_provenance_rules_version": "build-provenance-v1",
+        "build_provenance": {
+            "vulnerable": {
+                "face": "compile_commands.json",
+                "declared": list(BASE_DECLARED_FLAGS),
+                "effective": list(BASE_DECLARED_FLAGS),
+            },
+            "fixed": {
+                "face": "compile_commands.json",
+                "declared": list(BASE_DECLARED_FLAGS),
+                "effective": list(BASE_DECLARED_FLAGS),
+            },
+            "comparable": True,
+        },
+        "budget": {
+            "max_total_seconds": 900,
+            "max_fuzz_seconds": 300 if bundle_kind == "campaign" else 0,
+            "spent_seconds": 10,
+            "spent_fuzz_seconds": 5 if bundle_kind == "campaign" else 0,
+            "remaining_seconds": 890,
+            "remaining_fuzz_seconds": 295 if bundle_kind == "campaign" else 0,
+        },
+        "missing": [],
+        "error": None,
+        "evidence_complete": True,
+        "report_markdown_sha256": _sha256_hex(report_md),
+    }
+
+    files_spec: dict[str, tuple[str, bytes]] = {
+        "report.json": ("report_json", jsonutil.canonical_bytes(report_doc) + b"\n"),
+        "report.md": ("report_markdown", report_md),
+        "plan.json": ("plan", plan_bytes),
+        "review.json": (
+            "review",
+            jsonutil.canonical_bytes(
+                {
+                    "job_id": family_id,
+                    "plan_digest": plan_digest,
+                    "decision": "approve",
+                    "reviewer_id": "reviewer-01",
+                    "decided_at": "2099-01-01T00:00:00.000000Z",
+                }
+            )
+            + b"\n",
+        ),
+        "envelope.json": ("envelope", envelope_bytes),
+        "budget/snapshot.json": (
+            "budget_snapshot",
+            jsonutil.canonical_bytes(report_doc["budget"]) + b"\n",
+        ),
+        "metadata/execution.json": (
+            "execution_metadata",
+            jsonutil.canonical_bytes({"job_id": job_id, "generation": 1}) + b"\n",
+        ),
+        "metadata/probe.json": (
+            "probe",
+            jsonutil.canonical_bytes({"status": "completed"}) + b"\n",
+        ),
+        "metadata/case.json": (
+            "case_config",
+            jsonutil.canonical_bytes({"case_id": plan["case_id"]}) + b"\n",
+        ),
+    }
+
+    for version, fixture_name in (
+        ("vulnerable", "cmake_comparable_vulnerable.compile_commands.json"),
+        ("fixed", "cmake_comparable_fixed.compile_commands.json"),
+    ):
+        files_spec[f"build/{version}/metadata.json"] = (
+            "build_metadata",
+            jsonutil.canonical_bytes({"version": version, "status": "completed"}) + b"\n",
+        )
+        files_spec[f"build/{version}/build.log"] = (
+            "build_log",
+            f"build {version} ok\n".encode("utf-8"),
+        )
+        files_spec[f"build/{version}/parser"] = (
+            "build_artifact",
+            f"elf-{version}".encode("utf-8"),
+        )
+        if include_build_provenance:
+            files_spec[f"build/{version}/build_provenance/compile_commands.json"] = (
+                "build_provenance",
+                _fixture_bytes(fixture_name),
+            )
+
+    if bundle_kind == "campaign":
+        files_spec["fuzz/fuzz.log"] = ("fuzz_log", b"libFuzzer campaign ok\n")
+        files_spec["fuzz/provenance.json"] = (
+            "fuzz_provenance",
+            jsonutil.canonical_bytes({"rng_seed": 42, "crashes": 0}) + b"\n",
+        )
+    else:
+        for version in ("vulnerable", "fixed"):
+            for phase in ("normal", "candidate_1", "candidate_2"):
+                stdout_role = "normal_output" if phase == "normal" else "replay_stdout"
+                stderr_role = "normal_error" if phase == "normal" else "asan_log"
+                files_spec[f"replay/{version}/{phase}/stdout.log"] = (
+                    stdout_role,
+                    b"OK\n",
+                )
+                files_spec[f"replay/{version}/{phase}/stderr.log"] = (
+                    stderr_role,
+                    b"",
+                )
+                files_spec[f"replay/{version}/{phase}/metadata.json"] = (
+                    "replay_metadata",
+                    jsonutil.canonical_bytes(
+                        {"version": version, "phase": phase, "status": "completed"}
+                    )
+                    + b"\n",
+                )
+
+    entries: list[dict[str, Any]] = []
+    for rel_path, (role, payload) in sorted(files_spec.items()):
+        dest = root / rel_path
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(payload)
+        entries.append(
+            {
+                "path": rel_path,
+                "role": role,
+                "size_bytes": len(payload),
+                "sha256": _sha256_hex(payload),
+            }
+        )
+
+    manifest = {
+        "schema_version": 2,
+        "bundle_kind": bundle_kind,
+        "family_id": family_id,
+        "job_id": job_id,
+        "parent_job_id": family_id,
+        "round_no": None if bundle_kind == "campaign" else 1,
+        "plan_digest": plan_digest,
+        "envelope_digest": envelope_digest,
+        "experiment_digest": None,
+        "build_provenance_rules_version": "build-provenance-v1",
+        "verdict": verdict,
+        "reason_code": reason_code,
+        "created_at": "2099-01-01T00:00:00Z",
+        "build_ref": None,
+        "reuse_origin": None,
+        "files": entries,
+    }
+    (root / "manifest.json").write_bytes(jsonutil.canonical_bytes(manifest) + b"\n")
+    return root
+
+
+def test_declared_flags_must_be_subset_of_effective_flags():
+    provenance = _import_build_provenance()
+    vulnerable_face = _fixture_bytes("cmake_comparable_vulnerable.compile_commands.json")
+    missing_declared_face = _fixture_bytes(
+        "cmake_missing_declared_flag.compile_commands.json"
+    )
+
+    result = provenance.verify_build_provenance(
+        kind="cmake",
+        declared_compile_flags=BASE_DECLARED_FLAGS,
+        vulnerable_face=vulnerable_face,
+        fixed_face=missing_declared_face,
+        repo_root=REPO_ROOT,
+    )
+
+    assert result.comparable is False, (
+        "declared flag absent from effective set was accepted as comparable"
+    )
+    assert result.reason_code == "BUILD_PROVENANCE_MISSING", (
+        f"expected reason_code='BUILD_PROVENANCE_MISSING' when declared flag is missing, "
+        f"got {result.reason_code!r}"
+    )
+    assert "-D_GNU_SOURCE" in result.error_detail and "fixed" in result.error_detail, (
+        f"failure detail must locate version and missing declared flag: {result.error_detail!r}"
+    )
+
+
+def test_two_versions_must_have_equal_effective_flags():
+    provenance = _import_build_provenance()
+    vuln_cmake = _fixture_bytes("cmake_comparable_vulnerable.compile_commands.json")
+    unequal_fixed_cmake = _fixture_bytes(
+        "cmake_unequal_effective_fixed.compile_commands.json"
+    )
+    missing_unit_fixed_cmake = _fixture_bytes(
+        "cmake_missing_unit_fixed.compile_commands.json"
+    )
+
+    unequal_result = provenance.verify_build_provenance(
+        kind="cmake",
+        declared_compile_flags=BASE_DECLARED_FLAGS,
+        vulnerable_face=vuln_cmake,
+        fixed_face=unequal_fixed_cmake,
+        repo_root=REPO_ROOT,
+    )
+    assert unequal_result.comparable is False, (
+        "unequal effective flags (-O1 vs -O2 on src/parser.c) were treated as comparable"
+    )
+    assert unequal_result.reason_code == "BUILD_PROVENANCE_MISSING", (
+        f"expected BUILD_PROVENANCE_MISSING for unequal effective flags, got {unequal_result.reason_code!r}"
+    )
+    assert "src/parser.c" in unequal_result.error_detail, (
+        f"diff summary must locate differing compilation unit src/parser.c: {unequal_result.error_detail!r}"
+    )
+
+    missing_unit_result = provenance.verify_build_provenance(
+        kind="cmake",
+        declared_compile_flags=BASE_DECLARED_FLAGS,
+        vulnerable_face=vuln_cmake,
+        fixed_face=missing_unit_fixed_cmake,
+        repo_root=REPO_ROOT,
+    )
+    assert missing_unit_result.comparable is False, (
+        "single-version missing compilation unit (src/lexer.c) was treated as comparable"
+    )
+    assert missing_unit_result.reason_code == "BUILD_PROVENANCE_MISSING", (
+        f"expected BUILD_PROVENANCE_MISSING for unexplained missing CU, got {missing_unit_result.reason_code!r}"
+    )
+
+    make_vuln = _fixture_bytes("make_comparable_vulnerable.cc-shim.log")
+    make_unequal_fixed = _fixture_bytes("make_unequal_effective_fixed.cc-shim.log")
+    make_result = provenance.verify_build_provenance(
+        kind="make",
+        declared_compile_flags=BASE_DECLARED_FLAGS,
+        vulnerable_face=make_vuln,
+        fixed_face=make_unequal_fixed,
+        repo_root=REPO_ROOT,
+    )
+    assert make_result.comparable is False and (
+        make_result.reason_code == "BUILD_PROVENANCE_MISSING"
+    ), f"Make two-version effective flag difference must fail closed: {make_result!r}"
+
+
+def test_include_order_is_significant():
+    provenance = _import_build_provenance()
+
+    ab_norm = provenance.normalize_compile_flags(
+        ["-fsanitize=address", "-g", "-O1", "-I", "a", "-I", "b"],
+        repo_root=REPO_ROOT,
+    )
+    ba_norm = provenance.normalize_compile_flags(
+        ["-fsanitize=address", "-g", "-O1", "-I", "b", "-I", "a"],
+        repo_root=REPO_ROOT,
+    )
+    assert ab_norm != ba_norm, (
+        f"include order was normalized away: ab={ab_norm!r}, ba={ba_norm!r}"
+    )
+    assert ab_norm == ["-fsanitize=address", "-g", "-O1", "-Ia", "-Ib"], (
+        f"unexpected normalized sequence for -I a -I b: {ab_norm!r}"
+    )
+    assert ba_norm == ["-fsanitize=address", "-g", "-O1", "-Ib", "-Ia"], (
+        f"unexpected normalized sequence for -I b -I a: {ba_norm!r}"
+    )
+
+    face_ab = _fixture_bytes("cmake_include_order_ab.compile_commands.json")
+    face_ba = _fixture_bytes("cmake_include_order_ba.compile_commands.json")
+    result = provenance.verify_build_provenance(
+        kind="cmake",
+        declared_compile_flags=["-fsanitize=address", "-g", "-O1"],
+        vulnerable_face=face_ab,
+        fixed_face=face_ba,
+        repo_root=REPO_ROOT,
+    )
+    assert result.comparable is False, (
+        "two versions with reversed -I a -I b vs -I b -I a were treated as comparable"
+    )
+    assert result.reason_code == "BUILD_PROVENANCE_MISSING", (
+        f"expected BUILD_PROVENANCE_MISSING for reversed include order, got {result.reason_code!r}"
+    )
+
+
+def test_connected_and_split_flag_forms_are_equivalent():
+    provenance = _import_build_provenance()
+
+    split_tokens = [
+        "-fsanitize=address",
+        "-g",
+        "-O1",
+        "-I",
+        "/work/repo/include",
+        "-L",
+        "/work/repo/lib",
+        "-l",
+        "foo",
+        "-D",
+        "FOO=1",
+        "-U",
+        "BAR",
+        "-isystem",
+        "/opt/sysinc",
+        "-include",
+        "/work/repo/include/config.h",
+    ]
+    connected_tokens = [
+        "-fsanitize=address",
+        "-g",
+        "-O1",
+        "-I/work/repo/include",
+        "-L/work/repo/lib",
+        "-lfoo",
+        "-DFOO=1",
+        "-UBAR",
+        "-isystem/opt/sysinc",
+        "-include/work/repo/include/config.h",
+    ]
+    expected_canonical = [
+        "-fsanitize=address",
+        "-g",
+        "-O1",
+        "-Iinclude",
+        "-Llib",
+        "-lfoo",
+        "-DFOO=1",
+        "-UBAR",
+        "-isystem",
+        "/opt/sysinc",
+        "-include",
+        "include/config.h",
+    ]
+
+    norm_split = provenance.normalize_compile_flags(split_tokens, repo_root=REPO_ROOT)
+    norm_connected = provenance.normalize_compile_flags(
+        connected_tokens, repo_root=REPO_ROOT
+    )
+    assert norm_split == norm_connected == expected_canonical, (
+        f"split and joined flag forms were treated as different or non-canonical: "
+        f"split={norm_split!r}, connected={norm_connected!r}, expected={expected_canonical!r}"
+    )
+
+    cmake_result = provenance.verify_build_provenance(
+        kind="cmake",
+        declared_compile_flags=expected_canonical,
+        vulnerable_face=_fixture_bytes("cmake_flags_split.compile_commands.json"),
+        fixed_face=_fixture_bytes("cmake_flags_connected.compile_commands.json"),
+        repo_root=REPO_ROOT,
+    )
+    assert cmake_result.comparable is True and cmake_result.reason_code is None, (
+        f"CMake split vs connected 7-flag forms must be comparable: {cmake_result!r}"
+    )
+
+    make_result = provenance.verify_build_provenance(
+        kind="make",
+        declared_compile_flags=expected_canonical,
+        vulnerable_face=_fixture_bytes("make_flags_split.cc-shim.log"),
+        fixed_face=_fixture_bytes("make_flags_connected.cc-shim.log"),
+        repo_root=REPO_ROOT,
+    )
+    assert make_result.comparable is True and make_result.reason_code is None, (
+        f"Make split vs connected 7-flag forms must be comparable: {make_result!r}"
+    )
+
+
+def test_declared_flags_are_normalized_before_compare():
+    provenance = _import_build_provenance()
+    connected_face = _fixture_bytes("cmake_flags_connected.compile_commands.json")
+
+    declared_split_and_quoted = [
+        "-fsanitize=address",
+        '"-g"',
+        "-O1",
+        "-I",
+        "include",
+        "-L",
+        "lib",
+        "-l",
+        "foo",
+        "-D",
+        "FOO=1",
+        "-U",
+        "BAR",
+        "-isystem",
+        "/opt/sysinc",
+        "-include",
+        "include/config.h",
+    ]
+    result = provenance.verify_build_provenance(
+        kind="cmake",
+        declared_compile_flags=declared_split_and_quoted,
+        vulnerable_face=connected_face,
+        fixed_face=connected_face,
+        repo_root=REPO_ROOT,
+    )
+
+    assert result.comparable is True and result.reason_code is None, (
+        f"declared flags were compared without normalization: {result!r}"
+    )
+    assert result.normalized_declared == [
+        "-fsanitize=address",
+        "-g",
+        "-O1",
+        "-Iinclude",
+        "-Llib",
+        "-lfoo",
+        "-DFOO=1",
+        "-UBAR",
+        "-isystem",
+        "/opt/sysinc",
+        "-include",
+        "include/config.h",
+    ], f"normalized declared flags mismatch: {result.normalized_declared!r}"
+
+
+def test_cmake_and_make_success_faces_are_captured():
+    provenance = _import_build_provenance()
+
+    cmake_vuln = _fixture_bytes("cmake_comparable_vulnerable.compile_commands.json")
+    cmake_fixed = _fixture_bytes("cmake_comparable_fixed.compile_commands.json")
+    cmake_parsed = provenance.parse_provenance_face(
+        kind="cmake",
+        raw_face=cmake_vuln,
+        repo_root=REPO_ROOT,
+    )
+    assert list(cmake_parsed.units.keys()) == [
+        "src/lexer.c",
+        "src/parser.c",
+        "src/util.cpp",
+    ], (
+        "CMake multi-CU parser must filter pure link commands and sort source units "
+        f"ascending by repo-relative path: got {list(cmake_parsed.units.keys())!r}"
+    )
+    cmake_entry = provenance.archive_face_entry(
+        kind="cmake",
+        version="vulnerable",
+        raw_face=cmake_vuln,
+    )
+    assert cmake_entry.path == "build/vulnerable/build_provenance/compile_commands.json", (
+        f"unexpected CMake build_provenance archive path: {cmake_entry.path!r}"
+    )
+    assert cmake_entry.role == "build_provenance", (
+        f"expected role='build_provenance', got {cmake_entry.role!r}"
+    )
+
+    make_vuln = _fixture_bytes("make_comparable_vulnerable.cc-shim.log")
+    make_fixed = _fixture_bytes("make_comparable_fixed.cc-shim.log")
+    make_parsed = provenance.parse_provenance_face(
+        kind="make",
+        raw_face=make_vuln,
+        repo_root=REPO_ROOT,
+    )
+    assert list(make_parsed.units.keys()) == ["src/lexer.c", "src/parser.c"], (
+        "Make cc-shim multi-CU parser must exclude pure link commands and sort "
+        f"source units ascending: got {list(make_parsed.units.keys())!r}"
+    )
+    make_entry = provenance.archive_face_entry(
+        kind="make",
+        version="fixed",
+        raw_face=make_fixed,
+    )
+    assert make_entry.path == "build/fixed/build_provenance/cc-shim.log", (
+        f"unexpected Make build_provenance archive path: {make_entry.path!r}"
+    )
+    assert make_entry.role == "build_provenance", (
+        f"expected role='build_provenance', got {make_entry.role!r}"
+    )
+
+    cmake_cmp = provenance.verify_build_provenance(
+        kind="cmake",
+        declared_compile_flags=BASE_DECLARED_FLAGS,
+        vulnerable_face=cmake_vuln,
+        fixed_face=cmake_fixed,
+        repo_root=REPO_ROOT,
+    )
+    make_cmp = provenance.verify_build_provenance(
+        kind="make",
+        declared_compile_flags=BASE_DECLARED_FLAGS,
+        vulnerable_face=make_vuln,
+        fixed_face=make_fixed,
+        repo_root=REPO_ROOT,
+    )
+    assert cmake_cmp.comparable is True and make_cmp.comparable is True, (
+        f"comparable CMake/Make pairs must pass: cmake={cmake_cmp!r}, make={make_cmp!r}"
+    )
+
+
+def test_validation_bundle_requires_build_provenance(tmp_path: Path):
+    complete_exec = _write_v2_bundle(
+        tmp_path / "exec-complete",
+        bundle_kind="execution",
+        include_build_provenance=True,
+    )
+    verified = evidence.verify_bundle(complete_exec)
+    assert verified.manifest["schema_version"] == 2, (
+        f"expected v2 execution bundle with build_provenance to verify, got {verified.manifest!r}"
+    )
+
+    missing_exec = _write_v2_bundle(
+        tmp_path / "exec-missing-provenance",
+        bundle_kind="execution",
+        include_build_provenance=False,
+    )
+    with pytest.raises(evidence.BundleError, match="build_provenance"):
+        evidence.verify_bundle(missing_exec)
+
+    missing_campaign = _write_v2_bundle(
+        tmp_path / "campaign-missing-provenance",
+        bundle_kind="campaign",
+        include_build_provenance=False,
+    )
+    with pytest.raises(evidence.BundleError, match="build_provenance"):
+        evidence.verify_bundle(missing_campaign)
+
+
+def test_build_provenance_rules_version_is_bound_in_plan():
+    plan_v1_rules = _make_plan_v2(rules_version="build-provenance-v1")
+    plan_v2_rules = _make_plan_v2(rules_version="build-provenance-v2")
+
+    digest_v1 = contracts.plan_digest(plan_v1_rules)
+    digest_v2 = contracts.plan_digest(plan_v2_rules)
+    assert digest_v1 != digest_v2, (
+        "changing build_provenance_rules_version did not change plan_digest: "
+        f"digest_v1={digest_v1}, digest_v2={digest_v2}"
+    )
+
+    canonical_doc = json.loads(
+        contracts.canonical_plan_bytes(plan_v1_rules).decode("utf-8")
+    )
+    assert (
+        canonical_doc.get("build_provenance_rules_version") == "build-provenance-v1"
+    ), (
+        "build_provenance_rules_version missing from canonical Plan v2 bytes: "
+        f"keys={sorted(canonical_doc)}"
+    )
+
+    missing_rules = deepcopy(plan_v1_rules)
+    del missing_rules["build_provenance_rules_version"]
+    with pytest.raises(ValueError, match="build_provenance_rules_version"):
+        contracts.plan_digest(missing_rules)
+
+
+def test_missing_face_blocks_plan_freeze():
+    provenance = _import_build_provenance()
+
+    make_without_shim = _make_build_spec(
+        kind="make",
+        env={"CC": "clang", "CFLAGS": "-fsanitize=address -g -O1"},
+    )
+    make_decision = provenance.validate_build_spec_for_freeze(make_without_shim)
+    assert make_decision.ok is False, (
+        "Make BuildSpec without env.CC shim was allowed to freeze"
+    )
+    assert make_decision.reason_code == "BUILD_PROVENANCE_MISSING", (
+        f"expected BUILD_PROVENANCE_MISSING for Make without CC shim, got {make_decision.reason_code!r}"
+    )
+
+    cmake_without_export = _make_build_spec(
+        kind="cmake",
+        configure=["cmake", "-S", ".", "-B", "build", "-DCMAKE_C_COMPILER=clang"],
+    )
+    cmake_decision = provenance.validate_build_spec_for_freeze(cmake_without_export)
+    assert cmake_decision.ok is False, (
+        "CMake BuildSpec without compile_commands.json export was allowed to freeze"
+    )
+    assert cmake_decision.reason_code == "BUILD_PROVENANCE_MISSING", (
+        f"expected BUILD_PROVENANCE_MISSING for CMake without compile_commands export, "
+        f"got {cmake_decision.reason_code!r}"
+    )
+
+    legacy_make_env = _make_build_spec(kind="make")
+    legacy_make_env["make_env"] = {"CC": "/opt/datacon/cc-shim"}
+    make_env_decision = provenance.validate_build_spec_for_freeze(legacy_make_env)
+    assert make_env_decision.ok is False, (
+        "deprecated make_env field in BuildSpec must be rejected at freeze"
+    )
+
+
+def test_shell_recipe_requires_separate_face_review():
+    provenance = _import_build_provenance()
+    baseline_log = _fixture_bytes("shell_face_baseline.shell-face.log")
+    same_norm_log = _fixture_bytes("shell_face_same_normalized.shell-face.log")
+    drifted_log = _fixture_bytes("shell_face_drifted.shell-face.log")
+
+    unreviewed_shell = _make_build_spec(
+        kind="shell",
+        build=["sh", "./build.sh"],
+        env={"CC": "clang"},
+        shell_recipe_digest="sha256:" + "c" * 64,
+        shell_face_digest=None,
+        shell_face_review=None,
+    )
+    freeze_unreviewed = provenance.validate_build_spec_for_freeze(unreviewed_shell)
+    assert freeze_unreviewed.ok is False, (
+        "unreviewed shell recipe with only shell_recipe_digest counted as comparable"
+    )
+    assert freeze_unreviewed.reason_code == "BUILD_PROVENANCE_MISSING", (
+        f"expected BUILD_PROVENANCE_MISSING when shell_face_review/digest missing, "
+        f"got {freeze_unreviewed.reason_code!r}"
+    )
+
+    baseline_digest = provenance.shell_face_digest(
+        baseline_log, repo_root="/work/run-0001/repo"
+    )
+    reviewed_shell = _make_build_spec(
+        kind="shell",
+        build=["sh", "./build.sh"],
+        env={"CC": "clang"},
+        shell_recipe_digest="sha256:" + "c" * 64,
+        shell_face_digest=baseline_digest,
+        shell_face_review={
+            "reviewer_id": "reviewer-01",
+            "reviewed_at": "2099-01-01T00:00:00Z",
+            "face_kind": "build_log",
+        },
+    )
+    freeze_reviewed = provenance.validate_build_spec_for_freeze(reviewed_shell)
+    assert freeze_reviewed.ok is True, (
+        f"reviewed shell BuildSpec with shell_face_digest and shell_face_review must freeze: "
+        f"{freeze_reviewed!r}"
+    )
+
+    same_check = provenance.verify_shell_face(
+        build_spec=reviewed_shell,
+        actual_log=same_norm_log,
+        repo_root="/work/run-9999/repo",
+    )
+    assert same_check.comparable is True and same_check.reason_code is None, (
+        f"shell log differing only in path/timestamp must match pre-reviewed baseline: {same_check!r}"
+    )
+
+    drifted_check = provenance.verify_shell_face(
+        build_spec=reviewed_shell,
+        actual_log=drifted_log,
+        repo_root="/work/run-9999/repo",
+    )
+    assert drifted_check.comparable is False, (
+        "drifted shell build log (-O2 vs -O1) must not match pre-reviewed shell_face_digest"
+    )
+    assert drifted_check.reason_code == "BUILD_PROVENANCE_MISSING", (
+        f"expected BUILD_PROVENANCE_MISSING for drifted shell log, got {drifted_check.reason_code!r}"
+    )
