@@ -503,6 +503,25 @@ def test_include_order_is_significant():
         f"unexpected normalized sequence for -I b -I a: {ba_norm!r}"
     )
 
+    # §5 Rule 1: never reorder -D macros by name (-DB=2 -DA=1 != -DA=1 -DB=2).
+    db_da_norm = provenance.normalize_compile_flags(
+        ["-DB=2", "-DA=1"],
+        repo_root=REPO_ROOT,
+    )
+    da_db_norm = provenance.normalize_compile_flags(
+        ["-DA=1", "-DB=2"],
+        repo_root=REPO_ROOT,
+    )
+    assert db_da_norm != da_db_norm, (
+        f"-D macro order was normalized away: db_da={db_da_norm!r}, da_db={da_db_norm!r}"
+    )
+    assert db_da_norm == ["-DB=2", "-DA=1"], (
+        f"unexpected normalized sequence for -DB=2 -DA=1: {db_da_norm!r}"
+    )
+    assert da_db_norm == ["-DA=1", "-DB=2"], (
+        f"unexpected normalized sequence for -DA=1 -DB=2: {da_db_norm!r}"
+    )
+
     # §5 Rule 5 & Rule 6: duplicate -I keeps first occurrence only; -L/-l/-isystem/-include
     # must never be deduplicated or reordered.
     dedup_norm = provenance.normalize_compile_flags(
