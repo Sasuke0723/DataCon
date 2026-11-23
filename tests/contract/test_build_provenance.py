@@ -756,6 +756,15 @@ def test_cmake_and_make_success_faces_are_captured():
     assert cmake_entry.role == "build_provenance", (
         f"expected role='build_provenance', got {cmake_entry.role!r}"
     )
+    expected_cmake_sha = _sha256_hex(cmake_vuln)
+    assert cmake_entry.sha256 == expected_cmake_sha, (
+        f"expected bare 64-hex sha256 matching evidence manifest, got {cmake_entry.sha256!r}"
+    )
+    assert cmake_entry.as_dict()["sha256"] == expected_cmake_sha, (
+        f"archive_face_entry.as_dict()['sha256'] mismatch: {cmake_entry.as_dict()!r}"
+    )
+    assert len(cmake_entry.sha256) == 64 and cmake_entry.sha256 == cmake_entry.sha256.lower()
+    assert not cmake_entry.sha256.startswith("sha256:")
 
     make_vuln = _fixture_bytes("make_comparable_vulnerable.cc-shim.log")
     make_fixed = _fixture_bytes("make_comparable_fixed.cc-shim.log")
@@ -779,6 +788,15 @@ def test_cmake_and_make_success_faces_are_captured():
     assert make_entry.role == "build_provenance", (
         f"expected role='build_provenance', got {make_entry.role!r}"
     )
+    expected_make_sha = _sha256_hex(make_fixed)
+    assert make_entry.sha256 == expected_make_sha, (
+        f"expected bare 64-hex sha256 matching evidence manifest, got {make_entry.sha256!r}"
+    )
+    assert make_entry.as_dict()["sha256"] == expected_make_sha, (
+        f"archive_face_entry.as_dict()['sha256'] mismatch: {make_entry.as_dict()!r}"
+    )
+    assert len(make_entry.sha256) == 64 and make_entry.sha256 == make_entry.sha256.lower()
+    assert not make_entry.sha256.startswith("sha256:")
 
     cmake_cmp = provenance.verify_build_provenance(
         kind="cmake",
@@ -796,6 +814,88 @@ def test_cmake_and_make_success_faces_are_captured():
     )
     assert cmake_cmp.comparable is True and make_cmp.comparable is True, (
         f"comparable CMake/Make pairs must pass: cmake={cmake_cmp!r}, make={make_cmp!r}"
+    )
+
+    # §8 closed report.build_provenance schema (no extra diagnostic keys mixed in).
+    for cmp_result, expected_face in (
+        (cmake_cmp, "compile_commands.json"),
+        (make_cmp, "cc-shim.log"),
+    ):
+        summary = cmp_result.report_summary
+        assert set(summary.keys()) == {"vulnerable", "fixed", "comparable"}, (
+            f"report_summary must follow closed §8 schema: got keys {sorted(summary)}"
+        )
+        assert summary["comparable"] is True
+        for version in ("vulnerable", "fixed"):
+            assert set(summary[version].keys()) == {"face", "declared", "effective"}, (
+                f"report_summary.{version} must follow closed §8 schema: "
+                f"got keys {sorted(summary[version])}"
+            )
+            assert summary[version]["face"] == expected_face
+        diag = cmp_result.diagnostic_summary()
+        assert set(diag.keys()) == {
+            "rules_version",
+            "comparable",
+            "reason_code",
+            "error_detail",
+            "vulnerable_units",
+            "fixed_units",
+            "report_summary",
+        }
+        assert diag["report_summary"] == summary
+
+    # Make single-step compile+link (without -c) is captured; pure .o link and -E are excluded.
+    single_step_make_log = "\n".join(
+        [
+            json.dumps(
+                {
+                    "cwd": REPO_ROOT,
+                    "compiler": "clang",
+                    "argv": [
+                        "clang",
+                        "-fsanitize=address",
+                        "-g",
+                        "-O1",
+                        "-Iinclude",
+                        "src/a.c",
+                        "-o",
+                        "build/app",
+                    ],
+                }
+            ),
+            json.dumps(
+                {
+                    "cwd": REPO_ROOT,
+                    "compiler": "clang",
+                    "argv": [
+                        "clang",
+                        "-E",
+                        "-Iinclude",
+                        "src/preproc.c",
+                        "-o",
+                        "build/preproc.i",
+                    ],
+                }
+            ),
+            json.dumps(
+                {
+                    "cwd": REPO_ROOT,
+                    "compiler": "clang",
+                    "argv": ["clang", "build/a.o", "build/b.o", "-o", "build/linked"],
+                }
+            ),
+        ]
+    ).encode("utf-8")
+    single_step_parsed = provenance.parse_provenance_face(
+        kind="make",
+        raw_face=single_step_make_log,
+        repo_root=REPO_ROOT,
+    )
+    assert single_step_parsed.units == {
+        "src/a.c": ["-fsanitize=address", "-g", "-O1", "-Iinclude"]
+    }, (
+        "Make parser must capture single-step compile+link without -c while excluding "
+        f"preprocessor-only (-E) and pure .o link lines: got {single_step_parsed.units!r}"
     )
 
 

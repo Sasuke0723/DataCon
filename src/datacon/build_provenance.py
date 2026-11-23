@@ -8,7 +8,9 @@ from __future__ import annotations
 
 from collections import Counter
 from collections.abc import Iterable, Mapping, Sequence
+from copy import deepcopy
 from dataclasses import dataclass
+import hashlib
 from pathlib import Path, PurePosixPath
 import posixpath
 import re
@@ -91,6 +93,22 @@ class BuildProvenanceResult:
     report_summary: dict[str, Any]
     rules_version: str = RULES_VERSION
 
+    def diagnostic_summary(self) -> dict[str, Any]:
+        """Return full diagnostic details separate from the closed §8 ``report_summary``."""
+        return {
+            "rules_version": self.rules_version,
+            "comparable": self.comparable,
+            "reason_code": self.reason_code,
+            "error_detail": self.error_detail,
+            "vulnerable_units": {
+                unit: list(flags) for unit, flags in self.vulnerable_units.items()
+            },
+            "fixed_units": {
+                unit: list(flags) for unit, flags in self.fixed_units.items()
+            },
+            "report_summary": deepcopy(self.report_summary),
+        }
+
 
 @dataclass(frozen=True)
 class BuildSpecFreezeDecision:
@@ -116,7 +134,11 @@ class ShellFaceVerificationResult:
 
 @dataclass(frozen=True)
 class ArchiveFaceEntry:
-    """Manifest metadata for an archived ``build_provenance`` face artifact."""
+    """Manifest metadata for an archived ``build_provenance`` face artifact.
+
+    ``sha256`` is a bare 64-character lowercase hex digest matching
+    ``manifest.files[].sha256`` in ``interface-contract-delta.md`` §8.
+    """
 
     path: str
     role: str
@@ -347,19 +369,20 @@ def _strip_compile_argv(
     repo_root: str,
     cwd: str,
     explicit_source: str | None = None,
-) -> tuple[bool, list[str], list[str]]:
-    """Extract (is_compile, source_paths, raw_compile_flags) from a compiler argv.
+) -> tuple[bool, bool, list[str], list[str]]:
+    """Extract (is_compile, is_preprocess_only, source_paths, raw_compile_flags).
 
-    Strips compiler argv[0], ``-c``, ``-o <obj>`` / ``-o<obj>``, and source
-    file path(s) while leaving all compile flags (and arguments of options in
-    the closed 7-item set) intact.
+    Strips compiler argv[0], ``-c``, ``-E``, ``-o <obj>`` / ``-o<obj>``, and
+    source file path(s) while leaving all compile flags (and arguments of
+    options in the closed 7-item set) intact.
     """
     if not argv:
-        return False, [], []
+        return False, False, [], []
     first_cleaned = _clean_token(argv[0])
     args = list(argv[1:]) if not first_cleaned.startswith("-") else list(argv)
 
     has_compile_flag = False
+    is_preprocess_only = False
     raw_flags: list[str] = []
     discovered_sources: list[str] = []
 
@@ -370,6 +393,10 @@ def _strip_compile_argv(
         cleaned = _clean_token(tok)
         if cleaned == "-c":
             has_compile_flag = True
+            j += 1
+            continue
+        if cleaned == "-E":
+            is_preprocess_only = True
             j += 1
             continue
         if cleaned == "-o":
@@ -401,7 +428,7 @@ def _strip_compile_argv(
         raw_flags.append(tok)
         j += 1
 
-    return has_compile_flag, discovered_sources, raw_flags
+    return has_compile_flag, is_preprocess_only, discovered_sources, raw_flags
 
 
 def _record_unit(
@@ -529,13 +556,13 @@ def _parse_cmake_face(
         source_path = _normalize_path_arg(
             file_field.strip(), repo_root=repo_root, cwd=norm_dir
         )
-        is_compile, _sources, raw_flags = _strip_compile_argv(
+        is_compile, is_preprocess_only, _sources, raw_flags = _strip_compile_argv(
             argv,
             repo_root=repo_root,
             cwd=norm_dir,
             explicit_source=source_path,
         )
-        if not is_compile or not _is_source_path(source_path):
+        if not is_compile or is_preprocess_only or not _is_source_path(source_path):
             continue
 
         normalized = normalize_compile_flags(
@@ -605,12 +632,12 @@ def _parse_make_face(
         if not posixpath.isabs(norm_cwd):
             norm_cwd = posixpath.normpath(posixpath.join(repo_root, norm_cwd))
 
-        is_compile, source_paths, raw_flags = _strip_compile_argv(
+        _is_compile, is_preprocess_only, source_paths, raw_flags = _strip_compile_argv(
             argv_val,
             repo_root=repo_root,
             cwd=norm_cwd,
         )
-        if not is_compile or not source_paths:
+        if is_preprocess_only or not source_paths:
             continue
 
         normalized = normalize_compile_flags(
@@ -658,33 +685,25 @@ def parse_provenance_face(
 
 def _build_report_summary(
     *,
-    kind: str,
     face_name: str,
     comparable: bool,
-    reason_code: str | None,
     normalized_declared: list[str],
     vuln_units: Mapping[str, list[str]],
     fixed_units: Mapping[str, list[str]],
-    error_detail: str,
 ) -> dict[str, Any]:
+    """Build the closed §8 ``report.build_provenance`` payload."""
     return {
-        "rules_version": RULES_VERSION,
-        "face_kind": kind,
-        "comparable": comparable,
-        "reason_code": reason_code,
         "vulnerable": {
             "face": face_name,
             "declared": list(normalized_declared),
             "effective": _summarize_effective_flags(vuln_units),
-            "units": {unit: list(flags) for unit, flags in vuln_units.items()},
         },
         "fixed": {
             "face": face_name,
             "declared": list(normalized_declared),
             "effective": _summarize_effective_flags(fixed_units),
-            "units": {unit: list(flags) for unit, flags in fixed_units.items()},
         },
-        "error_detail": error_detail,
+        "comparable": comparable,
     }
 
 
@@ -712,14 +731,11 @@ def verify_build_provenance(
             vulnerable_units={},
             fixed_units={},
             report_summary=_build_report_summary(
-                kind=kind,
                 face_name=face_name,
                 comparable=False,
-                reason_code=BUILD_PROVENANCE_MISSING,
                 normalized_declared=[],
                 vuln_units={},
                 fixed_units={},
-                error_detail=detail,
             ),
         )
 
@@ -738,14 +754,11 @@ def verify_build_provenance(
             vulnerable_units={},
             fixed_units={},
             report_summary=_build_report_summary(
-                kind=kind,
                 face_name=face_name,
                 comparable=False,
-                reason_code=BUILD_PROVENANCE_MISSING,
                 normalized_declared=[],
                 vuln_units={},
                 fixed_units={},
-                error_detail=detail,
             ),
         )
 
@@ -780,14 +793,11 @@ def verify_build_provenance(
             vulnerable_units=vuln_units,
             fixed_units=fixed_units,
             report_summary=_build_report_summary(
-                kind=kind,
                 face_name=face_name,
                 comparable=False,
-                reason_code=BUILD_PROVENANCE_MISSING,
                 normalized_declared=normalized_declared,
                 vuln_units=vuln_units,
                 fixed_units=fixed_units,
-                error_detail=detail,
             ),
         )
 
@@ -873,14 +883,11 @@ def verify_build_provenance(
         vulnerable_units=vuln_units,
         fixed_units=fixed_units,
         report_summary=_build_report_summary(
-            kind=kind,
             face_name=face_name,
             comparable=comparable,
-            reason_code=reason_code,
             normalized_declared=normalized_declared,
             vuln_units=vuln_units,
             fixed_units=fixed_units,
-            error_detail=error_detail,
         ),
     )
 
@@ -1250,5 +1257,5 @@ def archive_face_entry(
         path=f"build/{version}/build_provenance/{FACE_FILENAMES[kind]}",
         role=BUILD_PROVENANCE_ROLE,
         size_bytes=len(raw_face),
-        sha256=jsonutil.digest_bytes(raw_face),
+        sha256=hashlib.sha256(raw_face).hexdigest(),
     )
